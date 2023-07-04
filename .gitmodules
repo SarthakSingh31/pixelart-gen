@@ -1,0 +1,4 @@
+
+[submodule "petal-decomposition"]
+	path = petal-decomposition
+	url = git@github.com:petabi/petal-decomposition.git
