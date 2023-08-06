@@ -3,14 +3,18 @@
 mod color;
 mod image;
 
-use std::{fs, path::PathBuf};
+use std::{
+    collections::{hash_map::RandomState, VecDeque},
+    fs,
+    path::PathBuf,
+};
 
 use ::image::{Rgb, RgbImage};
 use clap::Parser;
 use color::Color;
 use glam::{DVec2, DVec3, IVec2, UVec2};
 use image::LabImage;
-use palette::{color_difference::EuclideanDistance, IntoColor};
+use palette::{chromatic_adaptation::AdaptFrom, color_difference::EuclideanDistance};
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
@@ -95,8 +99,20 @@ fn main() -> anyhow::Result<()> {
     palette[1].0.perturb(delta.truncate());
 
     let dmc_colors = load_dmc_colors();
+    let lab_dmc_colors = dmc_colors
+        .iter()
+        .map(|color| palette::Lab::<palette::white_point::D65, _>::adapt_from(*color))
+        .collect::<Vec<_>>();
+    let colors: dashmap::DashSet<Rgb<u8>, RandomState> = dashmap::DashSet::default();
+    let mut output = RgbImage::new(out_size.x, out_size.y);
+    let mut running_average = 0.0;
+    let mut prev_changes = VecDeque::with_capacity(100);
+    let mut running_variance_avg = 0.0;
+    let mut prev_variances = VecDeque::with_capacity(100);
+    let mut variance_check_passed_count = 0;
 
     let mut i = 0;
+
     while t > T_FINAL {
         let start = std::time::Instant::now();
 
@@ -106,7 +122,37 @@ fn main() -> anyhow::Result<()> {
 
         let total_change = palette_refine(&mut super_pixels, &mut palette);
 
-        if total_change < EPSILON_PALETTE {
+        if prev_changes.len() == 100 {
+            running_average -= prev_changes.pop_front().unwrap();
+        }
+
+        prev_changes.push_back(total_change);
+        running_average += total_change;
+
+        let mean = running_average / 100.0;
+        let variance = prev_changes
+            .iter()
+            .map(|change| (mean - change).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / 100.0;
+
+        if prev_variances.len() == 100 {
+            running_variance_avg -= prev_variances.pop_front().unwrap();
+        }
+
+        prev_variances.push_back(variance);
+        running_variance_avg += variance;
+
+        if ((running_variance_avg / 100.0) - variance).abs() < 0.001 {
+            variance_check_passed_count += 1;
+            println!("Trigger due to variance");
+        } else {
+            variance_check_passed_count = 0;
+        }
+
+        if total_change < EPSILON_PALETTE || variance_check_passed_count > 100 {
+            variance_check_passed_count = 0;
             t *= ALPHA;
             if k < args.color_count as usize {
                 expand(
@@ -119,16 +165,20 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        colors.clear();
+
         let pixels = super_pixels
             .par_iter_mut()
             .map(|sp| sp.palette_color * DVec3::new(1.0, 1.1, 1.1))
-            .map(|color| palette::Lab::new(color.l(), color.a(), color.b()).into_color())
+            .map(|color| {
+                palette::Lab::<palette::white_point::D65, _>::new(color.l(), color.a(), color.b())
+            })
             .map(|color| {
                 let mut min_distance = f64::MAX;
                 let mut min_color = dmc_colors[0];
 
-                for dmc_color in &dmc_colors {
-                    let distance = dmc_color.distance_squared(color);
+                for (dmc_color, lab_dmc_color) in dmc_colors.iter().zip(lab_dmc_colors.iter()) {
+                    let distance = lab_dmc_color.distance_squared(color);
                     if distance < min_distance {
                         min_color = *dmc_color;
                         min_distance = distance;
@@ -139,10 +189,9 @@ fn main() -> anyhow::Result<()> {
             })
             .map(|color: palette::rgb::Srgb<f64>| {
                 let color = color.into_format::<u8>();
+                colors.insert(Rgb::from([color.red, color.green, color.blue]));
                 Rgb::from([color.red, color.green, color.blue])
             });
-
-        let mut output = RgbImage::new(out_size.x, out_size.y);
 
         pixels
             .zip(output.par_iter_mut().chunks(3))
@@ -152,46 +201,14 @@ fn main() -> anyhow::Result<()> {
                 *pixel[2] = color.0[2];
             });
 
-        output.save(format!("dmc-{}", args.output))?;
+        output.save(&args.output)?;
 
         println!(
-            "{i}: Total Change: {total_change}, k: {k}, t: {t}, time_delta: {:?}\n",
-            start.elapsed()
+            "{i}: Total Change: {total_change:.3}, k: {k}, t: {t:.3}, time_delta: {:?}, color_count: {:?}, variance: {variance:.4}, avg. variance: {:.4} variance count: {variance_check_passed_count}\n",
+            start.elapsed(), colors.len(), running_variance_avg / 100.0
         );
         i += 1;
     }
-
-    let pixels = super_pixels
-        .iter()
-        .map(|sp| sp.palette_color * DVec3::new(1.0, 1.1, 1.1))
-        .map(|color| palette::Lab::new(color.l(), color.a(), color.b()).into_color())
-        .map(|color| {
-            let mut min_distance = f64::MAX;
-            let mut min_color = dmc_colors[0];
-
-            for dmc_color in &dmc_colors {
-                let distance = dmc_color.distance_squared(color);
-                if distance < min_distance {
-                    min_color = *dmc_color;
-                    min_distance = distance;
-                }
-            }
-
-            min_color
-        })
-        .map(|color: palette::rgb::Srgb<f64>| {
-            let color = color.into_format::<u8>();
-            Rgb::from([color.red, color.green, color.blue])
-        });
-
-    let mut output = RgbImage::new(out_size.x, out_size.y);
-
-    for (i, color) in pixels.enumerate() {
-        let i = i as u32;
-        output.put_pixel(i % out_size.x, i / out_size.x, color);
-    }
-
-    output.save(format!("dmc-{}", args.output))?;
 
     Ok(())
 }
@@ -257,7 +274,7 @@ impl<'s> SuperPixel<'s> {
             *probability /= denom;
         }
 
-        hi -= 1.0;
+        hi = -1.0;
         for i in 0..k {
             let cluster = clusters[i];
             let mut prob = 0.0;
@@ -567,8 +584,6 @@ fn load_dmc_colors() -> Vec<palette::rgb::Srgb<f64>> {
 
     colors
         .into_iter()
-        .map(|DmcColor { red, green, blue }| {
-            palette::rgb::Srgb::new(red, green, blue).into_format()
-        })
+        .map(|DmcColor { red, green, blue }| palette::rgb::Rgb::new(red, green, blue).into_format())
         .collect()
 }

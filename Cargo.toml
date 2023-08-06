@@ -6,13 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [workspace]
-members = ["petal-decomposition"]
+members = ["petal-decomposition", "printpdf"]
 
 [dependencies]
 anyhow = "1.0.71"
 clap = { version = "4.3.10", features = ["derive"] }
 dashmap = "5.4.0"
 env_logger = "0.10.0"
+float-ord = "0.3.2"
 fxhash = "0.2.1"
 glam = "0.24.1"
 image = "0.24.6"
@@ -22,12 +23,16 @@ palette = "0.7.2"
 petal-decomposition = { path = "petal-decomposition", features = [
     "openblas-system",
 ] }
+printpdf = { path = "printpdf", features = ["embedded_images"] }
 rand = "0.8.5"
 rand_pcg = "0.3.1"
 rayon = "1.7.0"
+rusttype = "0.9.3"
 serde = { version = "1.0.166", features = ["derive"] }
 serde_json = "1.0.99"
 tokio = { version = "1.29.1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1.37"
-wgpu = "0.16.1"
-winit = "0.28.6"
+
+[profile.release]
+codegen-units = 1
+lto = true
